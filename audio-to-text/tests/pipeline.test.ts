@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { planChunks } from "../src/audio.js";
+import { listInputs, planChunks } from "../src/audio.js";
 import { buildTranscriptionPrompt } from "../src/prompts.js";
 import type { AudioChunk, ChunkTranscript, TokenUsage, TranscriptionContext, TranscriptionProvider } from "../src/providers/types.js";
 import { transcribePaths, type PipelineOptions } from "../src/pipeline.js";
@@ -139,6 +139,18 @@ describe("planChunks", () => {
       { start: 1780, duration: 620 },
     ]);
     expect(planChunks(100, 30, 10, 100)).toEqual([]);
+  });
+});
+
+describe("listInputs", () => {
+  it("reads a directory in numeric filename order and skips other files", async () => {
+    const dir = await makeTempDir();
+    await fs.writeFile(path.join(dir, "part10.mp3"), "");
+    await fs.writeFile(path.join(dir, "part2.wav"), "");
+    await fs.writeFile(path.join(dir, "part1.m4a"), "");
+    await fs.writeFile(path.join(dir, "notes.txt"), "");
+    const names = (await listInputs(dir)).map((file) => path.basename(file));
+    expect(names).toEqual(["part1.m4a", "part2.wav", "part10.mp3"]);
   });
 });
 

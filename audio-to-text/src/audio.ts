@@ -66,6 +66,14 @@ export function planChunks(
   return plans;
 }
 
+/** Filename order, with numeric runs compared as numbers: part2 before part10. */
+export function compareFileNames(left: string, right: string): number {
+  return path.basename(left).localeCompare(path.basename(right), undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
 export async function listInputs(input: string): Promise<string[]> {
   let stat: Awaited<ReturnType<typeof fs.stat>>;
   try {
@@ -82,7 +90,7 @@ export async function listInputs(input: string): Promise<string[]> {
     const files = names
       .filter((name) => extensionSet.has(path.extname(name).toLowerCase()))
       .map((name) => path.join(input, name))
-      .sort((a, b) => a.localeCompare(b));
+      .sort(compareFileNames);
     if (files.length === 0) {
       throw new Error(
         `No supported audio files in ${input}. Supported extensions: ${SUPPORTED_EXTENSIONS.join(", ")}`,

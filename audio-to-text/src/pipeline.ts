@@ -455,7 +455,16 @@ export async function transcribePaths(input: string, options: PipelineOptions): 
   const runUsage = { current: emptyUsage() };
   try {
     const files = await listInputs(input);
-    for (const file of files) {
+    if (files.length > 1) {
+      console.log(`${files.length} files, in name order:`);
+      for (const [index, file] of files.entries()) {
+        console.log(`  ${index + 1}. ${path.basename(file)}`);
+      }
+    }
+    for (const [index, file] of files.entries()) {
+      if (files.length > 1) {
+        console.log(`\n[${index + 1}/${files.length}] ${path.basename(file)}`);
+      }
       try {
         await transcribeOne(file, options, runUsage);
       } catch (error) {

@@ -41,7 +41,7 @@ npm run transcribe -- path/to/folder/
 npm run transcribe -- audio.m4a --provider gemini --model gemini-4-hydrogen --out ./transcripts --force
 ```
 
-Supported inputs: mp3, m4a, wav, ogg, flac, webm. Other formats are converted to mp3 while chunking. A directory is read one level deep; non-audio files are skipped.
+Supported inputs: mp3, m4a, wav, ogg, flac, webm. Other formats are converted to mp3 while chunking. A directory is read one level deep and transcribed in filename order (`part2` before `part10`). Non-audio files are skipped.
 
 `--provider` and `--model` override `.env`.
 
