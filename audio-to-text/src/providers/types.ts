@@ -3,7 +3,10 @@ export interface AudioChunk {
   index: number;
   total: number;
   offsetSec: number;
+  /** Length of this piece on the original recording. */
   durationSec: number;
+  /** Maps a time on the audio sent to the model back to seconds from this piece's original start. */
+  toOriginal?: (compressedSec: number) => number;
 }
 
 export interface Segment {

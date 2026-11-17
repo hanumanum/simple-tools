@@ -4,6 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { AudioChunk } from "./providers/types.js";
+import {
+  keptSpans,
+  parseSilenceLog,
+  type KeptSpan,
+  type SilenceSpan,
+  SILENCE_MIN_SEC,
+  SILENCE_NOISE_DB,
+} from "./silence.js";
 import { formatTimestamp, round3 } from "./time.js";
 
 const execFileAsync = promisify(execFile);
@@ -92,13 +100,18 @@ export async function listInputs(input: string): Promise<string[]> {
 }
 
 async function runTool(command: string, args: string[]): Promise<string> {
+  const { stdout } = await runToolCapture(command, args);
+  return stdout;
+}
+
+async function runToolCapture(command: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
   try {
-    const { stdout } = await execFileAsync(command, args, {
+    const { stdout, stderr } = await execFileAsync(command, args, {
       encoding: "utf8",
       maxBuffer: 16 * 1024 * 1024,
       windowsHide: true,
     });
-    return String(stdout);
+    return { stdout: String(stdout), stderr: String(stderr ?? "") };
   } catch (error) {
     const failure = error as NodeJS.ErrnoException & { stderr?: string | Buffer };
     if (failure.code === "ENOENT") {
@@ -134,6 +147,24 @@ export async function probeDuration(filePath: string): Promise<number> {
   return round3(duration);
 }
 
+export async function detectSilences(source: string, durationSec: number): Promise<SilenceSpan[]> {
+  const { stderr } = await runToolCapture("ffmpeg", [
+    "-nostdin",
+    "-hide_banner",
+    "-loglevel",
+    "info",
+    "-i",
+    source,
+    "-vn",
+    "-af",
+    `silencedetect=noise=${SILENCE_NOISE_DB}dB:d=${SILENCE_MIN_SEC}`,
+    "-f",
+    "null",
+    "-",
+  ]);
+  return parseSilenceLog(stderr, durationSec);
+}
+
 async function cutChunk(source: string, plan: ChunkPlan, destination: string): Promise<void> {
   await runTool("ffmpeg", [
     "-y",
@@ -160,8 +191,66 @@ async function cutChunk(source: string, plan: ChunkPlan, destination: string): P
   ]);
 }
 
-export async function writeChunk(source: string, plan: ChunkPlan, destination: string): Promise<void> {
-  await cutChunk(source, plan, destination);
+export async function writeChunk(
+  source: string,
+  plan: ChunkPlan,
+  destination: string,
+  silences: SilenceSpan[] = [],
+): Promise<KeptSpan[]> {
+  const rangeEnd = round3(plan.start + plan.duration);
+  const spans = keptSpans(plan.start, rangeEnd, silences);
+  if (spans.length === 0) {
+    throw new Error(`No audio left in the piece starting at ${plan.start.toFixed(1)}s.`);
+  }
+  const single = spans.length === 1 ? spans[0] : undefined;
+  const unchanged =
+    single !== undefined &&
+    Math.abs(single.originalStart - plan.start) < 0.05 &&
+    Math.abs(single.originalEnd - rangeEnd) < 0.05;
+  if (unchanged) {
+    await cutChunk(source, plan, destination);
+    return spans;
+  }
+  await runTool("ffmpeg", [
+    "-y",
+    "-nostdin",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-i",
+    source,
+    "-filter_complex",
+    concatFilter(spans),
+    "-map",
+    "[out]",
+    "-vn",
+    "-ac",
+    "1",
+    "-ar",
+    "16000",
+    "-c:a",
+    "libmp3lame",
+    "-q:a",
+    "4",
+    destination,
+  ]);
+  return spans;
+}
+
+function concatFilter(spans: KeptSpan[]): string {
+  const parts: string[] = [];
+  const labels: string[] = [];
+  for (let index = 0; index < spans.length; index += 1) {
+    const span = spans[index];
+    if (!span) continue;
+    const label = `a${index}`;
+    parts.push(
+      `[0:a]atrim=start=${span.originalStart.toFixed(3)}:end=${span.originalEnd.toFixed(3)},asetpts=PTS-STARTPTS[${label}]`,
+    );
+    labels.push(`[${label}]`);
+  }
+  parts.push(`${labels.join("")}concat=n=${labels.length}:v=0:a=1[out]`);
+  return parts.join(";");
 }
 
 export async function createWorkDir(): Promise<string> {

@@ -6,7 +6,7 @@ import {
   type Schema,
 } from "@google/genai";
 import { buildTranscriptionPrompt } from "../prompts.js";
-import { parseChunkTranscript, PartialTranscriptError, TranscriptParseError } from "../schema.js";
+import { EmptyTranscriptError, parseChunkTranscript, PartialTranscriptError, TranscriptParseError } from "../schema.js";
 import { describeFailure, withRetry } from "../retry.js";
 import { elapsedSec, formatTimestamp, sleep } from "../time.js";
 import { priceGeminiUsage } from "./gemini-pricing.js";
@@ -20,6 +20,23 @@ export const DEFAULT_GEMINI_MODEL = "gemini-4-hydrogen";
 const GEMINI_MAX_AUDIO_SEC = 9.5 * 60 * 60;
 const FILE_READY_TIMEOUT_MS = 3 * 60 * 1000;
 const STATUS_INTERVAL_MS = 15_000;
+
+function emptyResponseNote(piece: {
+  promptFeedback?: { blockReason?: string; blockReasonMessage?: string };
+  candidates?: { finishReason?: string; finishMessage?: string }[];
+}): string {
+  const block = piece.promptFeedback?.blockReason;
+  if (block) {
+    const message = piece.promptFeedback?.blockReasonMessage;
+    return `prompt blocked (${block}${message ? `: ${message}` : ""})`;
+  }
+  const candidate = piece.candidates?.[0];
+  if (candidate?.finishReason) {
+    const message = candidate.finishMessage ? `: ${candidate.finishMessage}` : "";
+    return `finish ${candidate.finishReason}${message}`;
+  }
+  return "";
+}
 
 const transcriptResponseSchema: Schema = {
   type: Type.OBJECT,
@@ -186,6 +203,7 @@ export class GeminiProvider implements TranscriptionProvider {
     let raw = "";
     let shown = 0;
     let usage: TokenUsage | undefined;
+    let stopNote = "";
     try {
       const stream = await this.client.models.generateContentStream(request);
       for await (const piece of stream) {
@@ -193,6 +211,8 @@ export class GeminiProvider implements TranscriptionProvider {
           const priced = priceGeminiUsage(piece.usageMetadata, this.model);
           if (priced) usage = priced;
         }
+        const note = emptyResponseNote(piece);
+        if (note) stopNote = note;
         const delta = piece.text ?? "";
         if (!delta) continue;
         raw += delta;
@@ -207,7 +227,8 @@ export class GeminiProvider implements TranscriptionProvider {
         }
       }
       if (!raw) {
-        throw new TranscriptParseError("Gemini returned an empty response.", "", usage);
+        const why = stopNote ? `: ${stopNote}` : " (0 output tokens)";
+        throw new EmptyTranscriptError(`Gemini returned an empty response${why}.`, usage);
       }
       return { text: raw, usage };
     } catch (error) {
@@ -226,7 +247,8 @@ export class GeminiProvider implements TranscriptionProvider {
   }
 
   private printSegment(chunk: AudioChunk, segment: StreamSegment): void {
-    const at = formatTimestamp(chunk.offsetSec + segment.start);
+    const local = chunk.toOriginal ? chunk.toOriginal(segment.start) : segment.start;
+    const at = formatTimestamp(chunk.offsetSec + local);
     const text = segment.text.replace(/\s+/g, " ").trim();
     console.log(`    [${at}] ${segment.speaker}: ${text}`);
   }

@@ -8,7 +8,7 @@ import { planChunks } from "../src/audio.js";
 import { buildTranscriptionPrompt } from "../src/prompts.js";
 import type { AudioChunk, ChunkTranscript, TokenUsage, TranscriptionContext, TranscriptionProvider } from "../src/providers/types.js";
 import { transcribePaths, type PipelineOptions } from "../src/pipeline.js";
-import { parseChunkTranscript, PartialTranscriptError, TranscriptParseError } from "../src/schema.js";
+import { EmptyTranscriptError, parseChunkTranscript, PartialTranscriptError, TranscriptParseError } from "../src/schema.js";
 
 const execFileAsync = promisify(execFile);
 const tempDirs: string[] = [];
@@ -326,6 +326,44 @@ describe("transcribePaths", () => {
     await expect(fs.access(path.join(dir, "talk.partial.json"))).rejects.toThrow();
   });
 
+  it("splits a piece that comes back empty and transcribes the shorter pieces", async () => {
+    const dir = await makeTempDir();
+    const audio = path.join(dir, "talk.mp3");
+    await makeTone(audio, 80);
+    const provider = new EmptyThenOkProvider();
+    expect(await transcribePaths(audio, options(dir, provider))).toBe(0);
+    expect(provider.calls).toBeGreaterThan(1);
+    expect(provider.longest).toBeGreaterThan(50);
+    expect(provider.chunks.every((chunk, index) => index === 0 || chunk.durationSec < provider.longest)).toBe(true);
+    expect(await fs.readFile(path.join(dir, "talk.md"), "utf8")).toContain("kept");
+  });
+
+  it("stops when an empty response is already too short to split", async () => {
+    const dir = await makeTempDir();
+    const audio = path.join(dir, "talk.mp3");
+    await makeTone(audio, 1);
+    const provider = new AlwaysEmptyProvider();
+    const failed = await transcribePaths(audio, options(dir, provider));
+    expect(failed).toBe(1);
+    expect(provider.calls).toBe(1);
+    const log = await fs.readFile(path.join(dir, "transcribe.log"), "utf8");
+    expect(log).toContain("empty response");
+    expect(log).not.toContain("Could not parse");
+  });
+
+  it("puts a turn after a removed pause back on the original clock", async () => {
+    const dir = await makeTempDir();
+    const audio = path.join(dir, "talk.wav");
+    await makeToneWithPause(audio);
+    const provider = new AfterPauseProvider();
+    expect(await transcribePaths(audio, options(dir, provider))).toBe(0);
+    const doc = JSON.parse(await fs.readFile(path.join(dir, "talk.json"), "utf8")) as {
+      segments: { start: number; text: string }[];
+    };
+    expect(doc.segments[0]?.text).toBe("later");
+    expect(doc.segments[0]?.start).toBeGreaterThan(5);
+  });
+
   it("starts over when force is set, even if progress was saved", async () => {
     const dir = await makeTempDir();
     const audio = path.join(dir, "talk.mp3");
@@ -344,6 +382,84 @@ describe("transcribePaths", () => {
     expect(await fs.readFile(path.join(dir, "talk.md"), "utf8")).not.toContain("kept");
   });
 });
+
+async function makeToneWithPause(destination: string): Promise<void> {
+  await execFileAsync("ffmpeg", [
+    "-y",
+    "-nostdin",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "lavfi",
+    "-i",
+    "sine=frequency=440:duration=2:sample_rate=16000",
+    "-f",
+    "lavfi",
+    "-i",
+    "anullsrc=channel_layout=mono:sample_rate=16000:duration=4",
+    "-f",
+    "lavfi",
+    "-i",
+    "sine=frequency=440:duration=2:sample_rate=16000",
+    "-filter_complex",
+    "[0:a]aformat=channel_layouts=mono,atrim=duration=2,asetpts=PTS-STARTPTS[a0];[1:a]atrim=duration=4,asetpts=PTS-STARTPTS[a1];[2:a]aformat=channel_layouts=mono,atrim=duration=2,asetpts=PTS-STARTPTS[a2];[a0][a1][a2]concat=n=3:v=0:a=1[out]",
+    "-map",
+    "[out]",
+    "-ar",
+    "16000",
+    "-c:a",
+    "pcm_s16le",
+    destination,
+  ]);
+}
+
+class EmptyThenOkProvider implements TranscriptionProvider {
+  readonly name = "fake";
+  readonly model = "fake-1";
+  readonly maxChunkSec = 3600;
+  calls = 0;
+  longest = 0;
+  readonly chunks: AudioChunk[] = [];
+
+  async transcribe(chunk: AudioChunk): Promise<ChunkTranscript> {
+    this.calls += 1;
+    this.chunks.push(chunk);
+    this.longest = Math.max(this.longest, chunk.durationSec);
+    if (chunk.durationSec > 50) {
+      throw new EmptyTranscriptError("Gemini returned an empty response (0 output tokens).");
+    }
+    return {
+      speakers: ["Artak"],
+      segments: [{ speaker: "Artak", start: 0.2, end: 1, text: "kept" }],
+    };
+  }
+}
+
+class AlwaysEmptyProvider implements TranscriptionProvider {
+  readonly name = "fake";
+  readonly model = "fake-1";
+  readonly maxChunkSec = 3600;
+  calls = 0;
+
+  async transcribe(): Promise<ChunkTranscript> {
+    this.calls += 1;
+    throw new EmptyTranscriptError("Gemini returned an empty response (0 output tokens).");
+  }
+}
+
+class AfterPauseProvider implements TranscriptionProvider {
+  readonly name = "fake";
+  readonly model = "fake-1";
+  readonly maxChunkSec = 3600;
+
+  async transcribe(): Promise<ChunkTranscript> {
+    return {
+      speakers: ["Artak"],
+      segments: [{ speaker: "Artak", start: 3, end: 3.8, text: "later" }],
+    };
+  }
+}
 
 class PartialThenDoneProvider implements TranscriptionProvider {
   readonly name = "fake";

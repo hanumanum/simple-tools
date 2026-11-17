@@ -25,6 +25,18 @@ export class TranscriptParseError extends Error {
   }
 }
 
+/** The model accepted the audio and returned no transcript text. Do not retry the same span. */
+export class EmptyTranscriptError extends Error {
+  readonly retryable = false;
+  readonly usage?: TokenUsage;
+
+  constructor(message: string, usage?: TokenUsage) {
+    super(message);
+    this.name = "EmptyTranscriptError";
+    this.usage = usage;
+  }
+}
+
 /** The stream died after one or more turns were already complete. Do not retry the same span. */
 export class PartialTranscriptError extends Error {
   readonly retryable = false;

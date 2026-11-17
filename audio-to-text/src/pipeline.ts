@@ -3,9 +3,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   createWorkDir,
+  detectSilences,
   listInputs,
-  OVERLAP_SEC,
-  planChunks,
   probeDuration,
   RESUME_OVERLAP_SEC,
   resolveChunkSec,
@@ -15,13 +14,15 @@ import { findExistingOutputs, writeOutputs, type TranscriptDocument } from "./fo
 import { mergeChunks, unionNames, type ChunkPiece } from "./merge.js";
 import type { AudioChunk, Segment, TokenUsage, TranscriptionContext, TranscriptionProvider } from "./providers/types.js";
 import { describeFailure } from "./retry.js";
-import { PartialTranscriptError, TranscriptParseError } from "./schema.js";
+import { EmptyTranscriptError, PartialTranscriptError, TranscriptParseError } from "./schema.js";
+import { compressedToOriginal, keptDuration, keptSpans, planChunksOnSilence, removableSilenceSec } from "./silence.js";
 import { elapsedSec, formatTimestamp, round3 } from "./time.js";
 import { addUsage, emptyUsage, formatTokenCounts, hasUsage } from "./usage.js";
 
 const PREVIOUS_SEGMENT_TAIL = 4;
 const PARSE_ATTEMPTS = 2;
 const MIN_ADVANCE_SEC = 1;
+const MIN_SPLIT_SEC = 30;
 
 interface SavedProgress {
   sourceFile: string;
@@ -188,6 +189,15 @@ function coverageEnd(pieces: ChunkPiece[], live: Segment[]): number {
   return round3(end);
 }
 
+function originalSegments(segments: Segment[], chunk: AudioChunk): Segment[] {
+  const toOriginal = chunk.toOriginal ?? ((value: number) => value);
+  return segments.map((segment) => ({
+    ...segment,
+    start: round3(toOriginal(segment.start)),
+    end: round3(toOriginal(segment.end)),
+  }));
+}
+
 function usableSegments(segments: Segment[]): Segment[] {
   return segments.filter(
     (segment) => segment.text.trim().length > 0 && Number.isFinite(segment.start) && segment.end > segment.start,
@@ -216,6 +226,14 @@ async function transcribeOne(input: string, options: PipelineOptions, runUsage: 
     const chunkSec = resolveChunkSec(options.chunkMinutes, options.provider.maxChunkSec);
     const durationSec = await probeDuration(input);
     const label = path.basename(input);
+    console.log(`${label} — scanning for pauses...`);
+    const silences = await detectSilences(input, durationSec);
+    const removable = removableSilenceSec(silences);
+    console.log(
+      removable >= 0.5
+        ? `${label} — ${silences.length} pauses, about ${removable.toFixed(0)}s will be shortened`
+        : `${label} — no long pauses`,
+    );
     const saved = options.force ? undefined : loadPartial(partialPath, resolvedSource);
     const pieces: ChunkPiece[] = [];
     let speakers = options.speakers?.filter((name) => name.trim()) ?? [];
@@ -239,7 +257,7 @@ async function transcribeOne(input: string, options: PipelineOptions, runUsage: 
     }
 
     const resumeStart = saved ? round3(Math.max(0, saved.coveredUntilSec - RESUME_OVERLAP_SEC)) : 0;
-    let plans = planChunks(durationSec, chunkSec, OVERLAP_SEC, resumeStart);
+    let plans = planChunksOnSilence(durationSec, chunkSec, silences, resumeStart);
     const from = resumeStart > 0 ? ` from ${formatTimestamp(resumeStart)}` : "";
     console.log(
       `${label} — ${durationSec.toFixed(1)}s, ${plans.length} chunk${plans.length === 1 ? "" : "s"} of up to ${Math.round(chunkSec)}s${from}`,
@@ -277,16 +295,20 @@ async function transcribeOne(input: string, options: PipelineOptions, runUsage: 
       const plan = plans[index];
       if (!plan) continue;
       const destination = path.join(workDir, `chunk-${String(index).padStart(3, "0")}.mp3`);
+      const preview = keptSpans(plan.start, round3(plan.start + plan.duration), silences);
+      const removed = round3(Math.max(0, plan.duration - keptDuration(preview)));
+      const silenceNote = removed >= 0.5 ? `, leaving out ${removed.toFixed(0)}s of silence` : "";
       console.log(
-        `  cutting chunk ${index + 1}/${plans.length} (${formatTimestamp(plan.start)}–${formatTimestamp(plan.start + plan.duration)})`,
+        `  cutting chunk ${index + 1}/${plans.length} (${formatTimestamp(plan.start)}–${formatTimestamp(plan.start + plan.duration)}${silenceNote})`,
       );
-      await writeChunk(input, plan, destination);
+      const spans = await writeChunk(input, plan, destination, silences);
       const chunk: AudioChunk = {
         path: destination,
         index,
         total: plans.length,
         offsetSec: plan.start,
         durationSec: plan.duration,
+        toOriginal: (compressedSec) => compressedToOriginal(compressedSec, spans, plan.start),
       };
       const ctx: TranscriptionContext = {
         language: options.language,
@@ -294,11 +316,13 @@ async function transcribeOne(input: string, options: PipelineOptions, runUsage: 
         hint: options.hint,
         previousSegments: previous && previous.length > 0 ? previous.slice(-PREVIOUS_SEGMENT_TAIL) : undefined,
         onSegment: (segment) => {
+          const [placed] = originalSegments([segment], chunk);
+          if (!placed) return;
           live.push({
-            speaker: segment.speaker,
-            start: round3(segment.start + chunk.offsetSec),
-            end: round3(segment.end + chunk.offsetSec),
-            text: segment.text,
+            speaker: placed.speaker,
+            start: round3(placed.start + chunk.offsetSec),
+            end: round3(placed.end + chunk.offsetSec),
+            text: placed.text,
           });
           persist();
         },
@@ -311,9 +335,29 @@ async function transcribeOne(input: string, options: PipelineOptions, runUsage: 
           live = [];
         });
       } catch (error) {
+        if (error instanceof EmptyTranscriptError) {
+          record(error.usage);
+          const shorter = round3(plan.duration / 2);
+          const rest =
+            plan.duration > MIN_SPLIT_SEC
+              ? planChunksOnSilence(durationSec, shorter, silences, plan.start)
+              : [];
+          const nextPlan = rest[0];
+          if (!nextPlan || nextPlan.duration >= plan.duration - 1) {
+            throw new Error(
+              `${error.message} The piece at ${formatTimestamp(plan.start)} is ${plan.duration.toFixed(0)}s and was not split.`,
+            );
+          }
+          console.log(
+            `  ${error.message} Splitting ${formatTimestamp(plan.start)} (${plan.duration.toFixed(0)}s) into shorter pieces.`,
+          );
+          plans = [...plans.slice(0, index), ...rest];
+          index -= 1;
+          continue;
+        }
         if (error instanceof PartialTranscriptError) {
           record(error.usage);
-          const kept = usableSegments(error.segments);
+          const kept = usableSegments(originalSegments(error.segments, chunk));
           if (kept.length === 0) throw error;
           const lastRel = Math.max(...kept.map((segment) => segment.end));
           const lastAbs = round3(plan.start + lastRel);
@@ -337,7 +381,7 @@ async function transcribeOne(input: string, options: PipelineOptions, runUsage: 
           });
           previous = kept;
           persist();
-          const rest = planChunks(durationSec, chunkSec, OVERLAP_SEC, next);
+          const rest = planChunksOnSilence(durationSec, chunkSec, silences, next);
           const nextPlan = rest[0];
           if (rest.length === 0) {
             console.log(
@@ -370,9 +414,10 @@ async function transcribeOne(input: string, options: PipelineOptions, runUsage: 
       console.log(
         `  chunk ${chunk.index + 1}/${chunk.total} done in ${elapsedSec(chunkStarted)}s (elapsed ${elapsedSec(started)}s)${usageLabel}`,
       );
-      speakers = unionNames(speakers, transcript.speakers);
-      previous = transcript.segments;
-      pieces.push({ offsetSec: chunk.offsetSec, durationSec: chunk.durationSec, transcript });
+      const placed = { ...transcript, segments: originalSegments(transcript.segments, chunk) };
+      speakers = unionNames(speakers, placed.speakers);
+      previous = placed.segments;
+      pieces.push({ offsetSec: chunk.offsetSec, durationSec: chunk.durationSec, transcript: placed });
       persist();
     }
 
